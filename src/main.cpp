@@ -22,8 +22,8 @@
 
 // Serial port definitions
 #define xbeeSerial Serial8
-// Use Serial2 on Teensy 4.1 for GPS
-HardwareSerial &gpsSerial = Serial2;
+// Use Serial5 on Teensy 4.1 for GPS (updated from Serial2)
+HardwareSerial &gpsSerial = Serial5;
 
 // Using standard namespace
 using namespace std;
@@ -238,19 +238,19 @@ void setup()
 
   // Start threads with appropriate priorities (higher number = higher priority)
   // Process altitude data with highest priority
-  altitudeThreadID = threads.addThread(altitudeThread, 0, 1024);
+  altitudeThreadID = threads.addThread(altitudeThread, 0, 1024, 0);
 
   // GPS has second highest priority
-  gpsThreadID = threads.addThread(gpsThread, 0, 1024);
+  gpsThreadID = threads.addThread(gpsThread, 0, 1024, 0);
 
   // Command processing must be responsive
-  commandThreadID = threads.addThread(commandThread, 0, 1024);
+  commandThreadID = threads.addThread(commandThread, 0, 1024, 0);
 
   // State monitoring runs at normal priority
-  stateMonitorThreadID = threads.addThread(stateMonitorThread, 0, 1024);
+  stateMonitorThreadID = threads.addThread(stateMonitorThread, 0, 1024, 0);
 
   // Telemetry runs at lowest priority as it's not time-critical
-  telemetryThreadID = threads.addThread(telemetryThread, 0, 1024);
+  telemetryThreadID = threads.addThread(telemetryThread, 0, 1024, 0);
 
   Serial.println("All threads started successfully");
   Serial.println("System running in multithreaded mode");
@@ -267,9 +267,8 @@ void loop()
   {
     // Report thread health
     Serial.println("===== System Status =====");
-    Serial.print("Main CPU Usage: ");
     Serial.print(threads.threadsInfo());
-    Serial.println("%");
+    Serial.println("=========================");
 
     // Report current state
     State currentStateSnapshot;
@@ -928,9 +927,37 @@ void altitudeThread()
 // Function for GPS sensor thread
 void gpsThread()
 {
-  // Configure GPS
+  // Configure GPS on Serial5
   gpsSerial.begin(9600);
-
+  
+  Serial.println("GPS Thread started - using Serial5");
+  uint8_t gpsRetryCount = 0;
+  bool gpsInitialized = false;
+  
+  // Add a small delay to ensure serial port is ready
+  threads.delay(500);
+  
+  while (!gpsInitialized && gpsRetryCount < 5) {
+    if (gpsSerial) {
+      Serial.println("GPS Serial5 initialized successfully");
+      gpsInitialized = true;
+    } else {
+      gpsRetryCount++;
+      Serial.print("GPS Serial5 initialization attempt ");
+      Serial.print(gpsRetryCount);
+      Serial.println(" failed, retrying...");
+      gpsSerial.begin(9600);
+      threads.delay(500);
+    }
+  }
+  
+  if (!gpsInitialized) {
+    Serial.println("WARNING: Failed to initialize GPS on Serial5!");
+  }
+  
+  // Main GPS processing loop
+  unsigned long lastSatelliteReport = 0;
+  
   while (true)
   {
     // Process all available GPS data
@@ -955,7 +982,24 @@ void gpsThread()
         sprintf(timeStr, "%02d:%02d", gps.time.hour(), gps.time.minute());
         safeData.gpsTime = String(timeStr);
       }
+      
+      // Log updated GPS data for debugging
+      Serial.print("GPS update - Lat: ");
+      Serial.print(safeData.latitude, 6);
+      Serial.print(", Long: ");
+      Serial.print(safeData.longitude, 6);
+      Serial.print(", Sats: ");
+      Serial.println(safeData.satellites);
+      
       gpsMutex.unlock();
+    }
+    
+    // Periodically report satellite count even if position hasn't been updated
+    unsigned long currentTime = millis();
+    if (currentTime - lastSatelliteReport > 5000) { // Every 5 seconds
+      Serial.print("GPS satellites in view: ");
+      Serial.println(gps.satellites.value());
+      lastSatelliteReport = currentTime;
     }
 
     threads.delay(GPS_UPDATE_INTERVAL); // 10Hz GPS processing
@@ -1018,13 +1062,29 @@ void telemetryThread()
         gpsMutex.unlock();
       }
 
-      // Construct and send telemetry with mutex protection
+      // IMPORTANT: Update the global telemetryData (needed for constructMessage)
+      xbeeMutex.lock();
+      telemetryData = threadTelemetry;
+      
+      // Construct message using updated telemetryData
       String dataToSend = "<T" + constructMessage() + ">";
-      {
-        xbeeMutex.lock();
-        Serial8.println(dataToSend);
-        xbeeMutex.unlock();
-      }
+      
+      // Send data to XBee
+      Serial8.println(dataToSend);
+      
+      // Debug output
+      Serial.println("Sending telemetry packet #" + String(threadTelemetry.PACKET_COUNT));
+      Serial.println("Altitude: " + String(threadTelemetry.ALTITUDE) + " m");
+      Serial.println("Temperature: " + String(threadTelemetry.TEMPERATURE) + " C");
+      Serial.println("Pressure: " + String(threadTelemetry.PRESSURE) + " hPa");
+      
+      // Add GPS debug output
+      Serial.println("GPS Latitude: " + threadTelemetry.GPS_LATITUDE);
+      Serial.println("GPS Longitude: " + threadTelemetry.GPS_LONGITUDE);
+      Serial.println("GPS Satellites: " + threadTelemetry.GPS_SATS);
+      Serial.println("GPS Time: " + threadTelemetry.GPS_TIME);
+      
+      xbeeMutex.unlock();
     }
 
     threads.delay(TELEMETRY_INTERVAL); // 1Hz telemetry updates
@@ -1152,67 +1212,67 @@ void stateMonitorThread()
 }
 
 // Function for command processing thread
-void commandThread()
-{
+void commandThread() {
   static String receivedData = "";
 
-  while (true)
-  {
+  while (true) {
     // Check for XBee commands with mutex protection
     xbeeMutex.lock();
     bool dataAvailable = xbeeSerial.available() > 0;
     xbeeMutex.unlock();
-
-    if (dataAvailable)
-    {
+    
+    if (dataAvailable) {
       xbeeMutex.lock();
       char character = xbeeSerial.read();
       xbeeMutex.unlock();
-
+      
       receivedData += character;
-
+      
+      // Debug print to verify data reception
+      if (character == '>' || character == '\n') {
+        Serial.print("Raw XBee data received: ");
+        Serial.println(receivedData);
+      }
+      
       // Process complete commands
-      if (receivedData.indexOf('<') != -1 && receivedData.indexOf('>') != -1)
-      {
+      if (receivedData.indexOf('<') != -1 && receivedData.indexOf('>') != -1) {
         int startIdx = receivedData.indexOf('<') + 1;
         int endIdx = receivedData.indexOf('>');
-
-        if (startIdx < endIdx)
-        {
+        
+        if (startIdx < endIdx) {
           String extractedData = receivedData.substring(startIdx, endIdx);
-
+          
+          // Log the received command for debugging
+          Serial.print("Command received: ");
+          Serial.println(extractedData);
+          
           // Process the command based on type
-          if (extractedData.length() > 0)
-          {
+          if (extractedData.length() > 0) {
             char cmdType = extractedData.charAt(0);
-
-            switch (cmdType)
-            {
-            case 'C': // Control commands
-              String cmd = extractedData.substring(1);
-
-              if (cmd.equals("X/ON"))
-              {
-                telemetryEnabled = true;
-                cxonCommandReceived = true;
-
-                // Log the command
-                Serial.println("Command received: CX/ON - Telemetry enabled");
-              }
-              else if (cmd.equals("X/OFF"))
-              {
-                telemetryEnabled = false;
-                Serial.println("Command received: CX/OFF - Telemetry disabled");
-              }
-              break;
+            
+            switch (cmdType) {
+              case 'C': // Control commands
+                handleGCSCommand(extractedData.substring(1));
+                break;
+                
+              default:
+                Serial.print("Unknown command type: ");
+                Serial.println(cmdType);
+                break;
             }
           }
         }
-
+        
         receivedData = ""; // Reset for next command
       }
+      
+      // Reset buffer if it gets too long without finding a complete command
+      if (receivedData.length() > 100) {
+        Serial.println("Command buffer overflow - resetting");
+        receivedData = "";
+      }
     }
-
+    
     threads.delay(20); // 50Hz command checking
   }
 }
