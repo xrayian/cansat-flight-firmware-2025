@@ -131,6 +131,7 @@ void calculateAltitude();
 void calculateGPS();
 float changeOfAltitude();
 String getStateString(State state);
+void processBatteryVoltage();
 
 // Thread function prototypes
 void altitudeThread();
@@ -213,6 +214,9 @@ float lastValidAltitude = 0;       // Store the last valid altitude reading
 bool altitudeValid = false;        // Flag to indicate if current altitude is valid
 int failedReadingsCount = 0;       // Counter for consecutive failed readings
 float fallbackAltitude = 0;        // Fallback altitude to use when sensor fails
+const int analogPin = 15;      // Pin 15 connected to the voltage divider 'S'
+const float referenceVoltage = 3.3; // Teensy 4.1 analog reference (default is 3.3V)
+const float multiplier = 5.0; 
 
 // Arduino setup and loop functions
 
@@ -221,6 +225,8 @@ void setup()
   // Initialize serial communication with higher baud rates for improved performance
   Serial.begin(115200); // Increased from 9600 to 115200 for faster logging
   Serial8.begin(9600);  // XBee 900HP Pro default baud rate (maintain compatibility)
+
+  analogReadResolution(12);
 
   Serial.println("Cansat Flight Software v2.0 - Multithreaded Edition");
   Serial.println("Initializing hardware and communication...");
@@ -251,6 +257,8 @@ void setup()
 
   // Telemetry runs at lowest priority as it's not time-critical
   telemetryThreadID = threads.addThread(telemetryThread, 0, 1024, 0);
+
+  
 
   Serial.println("All threads started successfully");
   Serial.println("System running in multithreaded mode");
@@ -310,6 +318,16 @@ void loop()
 }
 
 // Custom functions
+
+void processBatteryVoltage() {
+  int rawADC = analogRead(analogPin);                      // Read raw ADC value
+  float vOut = (rawADC / 4095.0) * referenceVoltage;       // Convert to voltage
+  float vIn = vOut * multiplier;                           // Calculate original input voltage
+  // Serial.print("Battery Voltage ");
+  // Serial.print(vIn, 3);
+  // Serial.println(" V");
+  telemetryData.VOLTAGE = vIn;                             // Store voltage in telemetry data
+}
 
 void processSensorBMP()
 {
@@ -801,6 +819,28 @@ void altitudeThread()
   constexpr int CALIBRATION_SAMPLES = 10;
   float calibrationValues[CALIBRATION_SAMPLES];
 
+  // Get and display current atmospheric pressure
+  if (bmp.performReading()) {
+    float currentPressure = bmp.pressure / 100.0;
+    Serial.print("Current atmospheric pressure: ");
+    Serial.print(currentPressure);
+    Serial.println(" hPa");
+    
+    Serial.print("Current altitude with standard sea level pressure (");
+    Serial.print(SEALEVELPRESSURE_HPA);
+    Serial.print(" hPa): ");
+    Serial.print(bmp.readAltitude(SEALEVELPRESSURE_HPA));
+    Serial.println(" meters");
+    
+    // Calculate the actual sea level pressure based on known altitude
+    // Uncomment and set your known altitude if needed
+    // float knownAltitude = 0.0; // Replace with your actual altitude in meters
+    // float calculatedSeaLevel = bmp.seaLevelForAltitude(knownAltitude, currentPressure);
+    // Serial.print("Calculated sea level pressure: ");
+    // Serial.print(calculatedSeaLevel);
+    // Serial.println(" hPa");
+  }
+
   // Calibrate sensor
   int goodSamples = 0;
   Serial.println("Calibrating altitude sensor...");
@@ -811,7 +851,13 @@ void altitudeThread()
       float reading = bmp.readAltitude(SEALEVELPRESSURE_HPA) * 100.0;
       if (reading > MIN_VALID_ALTITUDE && reading < MAX_VALID_ALTITUDE)
       {
-        calibrationValues[goodSamples++] = reading;
+        calibrationValues[goodSamples] = reading;
+        Serial.print("Calibration sample ");
+        Serial.print(goodSamples + 1);
+        Serial.print(": ");
+        Serial.print(reading/100.0);
+        Serial.println(" meters");
+        goodSamples++;
       }
     }
     threads.yield(); // Allow other threads to run during calibration
@@ -826,6 +872,10 @@ void altitudeThread()
   }
   initialAlt = sum / CALIBRATION_SAMPLES;
   calibrated = true;
+
+  Serial.print("Final calibration: Initial altitude set as zero reference point (");
+  Serial.print(initialAlt/100.0);
+  Serial.println(" meters)");
 
   // Store in thread-safe variable
   safeData.initialAltitude.store(initialAlt);
@@ -1083,6 +1133,8 @@ void telemetryThread()
       Serial.println("GPS Longitude: " + threadTelemetry.GPS_LONGITUDE);
       Serial.println("GPS Satellites: " + threadTelemetry.GPS_SATS);
       Serial.println("GPS Time: " + threadTelemetry.GPS_TIME);
+
+      // Serial.println("Voltage: " + threadTelemetry.VOLTAGE + " V");
       
       xbeeMutex.unlock();
     }
