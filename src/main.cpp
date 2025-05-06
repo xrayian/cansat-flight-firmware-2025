@@ -244,19 +244,19 @@ void setup()
 
   // Start threads with appropriate priorities (higher number = higher priority)
   // Process altitude data with highest priority
-  altitudeThreadID = threads.addThread(altitudeThread, 0, 1024, 0);
+  altitudeThreadID = threads.addThread(altitudeThread);
 
   // GPS has second highest priority
-  gpsThreadID = threads.addThread(gpsThread, 0, 1024, 0);
+  gpsThreadID = threads.addThread(gpsThread);
 
   // Command processing must be responsive
-  commandThreadID = threads.addThread(commandThread, 0, 1024, 0);
+  commandThreadID = threads.addThread(commandThread);
 
   // State monitoring runs at normal priority
-  stateMonitorThreadID = threads.addThread(stateMonitorThread, 0, 1024, 0);
+  stateMonitorThreadID = threads.addThread(stateMonitorThread);
 
   // Telemetry runs at lowest priority as it's not time-critical
-  telemetryThreadID = threads.addThread(telemetryThread, 0, 1024, 0);
+  telemetryThreadID = threads.addThread(telemetryThread);
 
   
 
