@@ -1,38 +1,68 @@
+/*
+ * CanSat Flight Software - Multithreaded Reference Implementation
+ * Teensy 4.1 + TeensyThreads
+ *
+ * Reference code for CanSat teams. This is NOT the software flown at
+ * CanSat 2025. See README.md for the architecture and the threading rules.
+ */
+
 #include <Arduino.h>
-#include "wiring.h"
-// Add TeensyThreads library for multithreading
 #include <TeensyThreads.h>
-// Core sensors and communication
 #include <Wire.h>
 #include <HardwareSerial.h>
-// Sensor libraries
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP3XX.h>
 #include <TinyGPSPlus.h>
-// Standard libraries
-#include <string>
-#include <vector>
 #include <atomic>
+#include <math.h>
 
-// Constants
-#define SEALEVELPRESSURE_HPA (1013.25) // Dhaka's approximate sea-level pressure in hPa
-#define BMP_UPDATE_INTERVAL 40         // 25Hz update rate (ms)
-#define GPS_UPDATE_INTERVAL 100        // 10Hz update rate (ms)
-#define TELEMETRY_INTERVAL 1000        // 1Hz telemetry transmission (ms)
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+#define SEALEVELPRESSURE_HPA (1013.25) // Standard sea-level pressure (hPa)
+#define BMP_UPDATE_INTERVAL 40         // 25 Hz (ms)
+#define GPS_UPDATE_INTERVAL 100        // 10 Hz (ms)
+#define TELEMETRY_INTERVAL 1000        // 1 Hz (ms)
+#define STATE_UPDATE_INTERVAL 100      // 10 Hz (ms)
+#define COMMAND_POLL_INTERVAL 20       // 50 Hz (ms)
+#define THREAD_STACK_SIZE 4096         // Bytes per thread
 
-// Serial port definitions
-#define xbeeSerial Serial8
-// Use Serial5 on Teensy 4.1 for GPS (updated from Serial2)
+#define xbeeSerial Serial8             // XBee: TX8 = pin 35, RX8 = pin 34
 HardwareSerial &gpsSerial = Serial5;
 
-// Using standard namespace
-using namespace std;
+const char *TEAM_ID = "3158";
+const char *HANDSHAKE_REQUEST = "<A3158GCS>";
+const char *HANDSHAKE_ACK = "<A3158ACK>";
 
-// Global objects
-Adafruit_BMP3XX bmp;
-TinyGPSPlus gps;
+// Altitudes are in centimetres unless the name says otherwise.
+const int AVG_SAMPLES = 3;
+const int CALIBRATION_SAMPLES = 10;
+const int MAX_FAILED_READINGS = 5;
+const float MIN_VALID_ALTITUDE = -10000.0;      // -100 m
+const float MAX_VALID_ALTITUDE = 1000000.0;     // 10 km
+const float STABILITY_THRESHOLD = 50.0;         // 0.5 m between readings
+const float ASCENT_THRESHOLD = 100.0;           // 1 m above the pad
+const int ASCENT_CONFIRMATION_COUNT = 5;
+const float DESCENT_DETECTION_THRESHOLD = 50.0; // 0.5 m below peak
+const int DESCENT_DETECTION_COUNT = 4;
+const float DESCENT_2_RATIO = 0.75;             // Below 75% of peak
+const float LANDING_THRESHOLD = 500.0;          // 5 m
+const float LANDING_VELOCITY_MPS = 0.5;         // m/s
 
-// Define the State enum
+const int BATTERY_PIN = 15;          // Voltage divider output
+const float ADC_REFERENCE = 3.3;     // Teensy 4.1 analog reference (V)
+const float DIVIDER_MULTIPLIER = 5.0;
+
+// ---------------------------------------------------------------------------
+// Hardware objects, each owned by exactly one thread
+// ---------------------------------------------------------------------------
+Adafruit_BMP3XX bmp; // altitudeThread only. Add a Wire1 lock if another
+                     // thread (for example an IMU thread) shares the bus.
+TinyGPSPlus gps;     // gpsThread only.
+
+// ---------------------------------------------------------------------------
+// State machine
+// ---------------------------------------------------------------------------
 enum State {
     RECOVER,
     BOOT,
@@ -44,927 +74,486 @@ enum State {
     LANDING
 };
 
-// Thread-safe state management
-Threads::Mutex stateMutex;
-State currentState = BOOT;
-State lastState = BOOT;
+std::atomic<State> currentState{BOOT}; // Written only by stateMonitorThread.
 
-// Thread IDs
 int altitudeThreadID = -1;
 int gpsThreadID = -1;
-int telemetryThreadID = -1;
-int stateMonitorThreadID = -1;
 int commandThreadID = -1;
+int stateMonitorThreadID = -1;
+int telemetryThreadID = -1;
 
-// Thread-safe data storage with atomic variables
-struct ThreadSafeData {
-    // Use std::atomic for thread-safe variables
-    std::atomic<float> altitude{0};
-    std::atomic<float> initialAltitude{0};
-    std::atomic<float> highestAltitude{0};
-    std::atomic<float> velocity{0};
-    std::atomic<float> temperature{0};
-    std::atomic<float> pressure{0};
-    std::atomic<float> voltage{3.3}; // Default voltage
+// ---------------------------------------------------------------------------
+// Locks: one per shared resource
+// ---------------------------------------------------------------------------
+Threads::Mutex serialLock; // USB Serial (debug log)
+Threads::Mutex xbeeLock;   // Serial8 (XBee radio)
+Threads::Mutex gpsLock;    // gpsData
+Threads::Mutex cmdLock;    // lastCmdEcho
+
+// ---------------------------------------------------------------------------
+// Shared data
+// ---------------------------------------------------------------------------
+struct SensorData {
+    std::atomic<float> altitude{0};        // cm, relative to the pad
+    std::atomic<float> initialAltitude{0}; // cm, absolute
+    std::atomic<float> highestAltitude{0}; // cm, relative
+    std::atomic<float> velocity{0};        // m/s, positive is up
+    std::atomic<float> temperature{0};     // C
+    std::atomic<float> pressure{0};        // hPa
+    std::atomic<float> voltage{0};         // V
     std::atomic<bool> altitudeValid{false};
     std::atomic<bool> sensorStable{false};
     std::atomic<int> packetCount{0};
-    // GPS data (protected by mutex when accessed)
-    float latitude = 0;
-    float longitude = 0;
+};
+SensorData sensors;
+
+struct GpsSnapshot {
+    double latitude = 0;
+    double longitude = 0;
+    float altitude = 0; // m, above mean sea level
     int satellites = 0;
-    String gpsTime = "0:0";
+    String time = "0:0";
 };
+GpsSnapshot gpsData; // Guarded by gpsLock. Access through readGps()/writeGps().
 
-ThreadSafeData safeData;
+GpsSnapshot readGps() {
+    Threads::Scope lock(gpsLock);
+    return gpsData;
+}
 
-// structs
+void writeGps(const GpsSnapshot &g) {
+    Threads::Scope lock(gpsLock);
+    gpsData = g;
+}
 
+String lastCmdEcho = ""; // Guarded by cmdLock. Access through the helpers.
+
+String readCmdEcho() {
+    Threads::Scope lock(cmdLock);
+    return lastCmdEcho;
+}
+
+void writeCmdEcho(const String &cmd) {
+    Threads::Scope lock(cmdLock);
+    lastCmdEcho = cmd;
+}
+
+std::atomic<bool> telemetryEnabled{false};
+std::atomic<bool> cxonCommandReceived{false};
+
+// ---------------------------------------------------------------------------
+// Telemetry packet (built locally by telemetryThread, never shared)
+// ---------------------------------------------------------------------------
 struct TelemetryData {
-    String TEAM_ID;
-    String MISSION_TIME;
-    int PACKET_COUNT;
-    String MODE;
-    int STATE;
-    float ALTITUDE;
-    float TEMPERATURE;
-    float PRESSURE;
-    float VOLTAGE;
-    float GYRO_R;
-    float GYRO_P;
-    float GYRO_Y;
-    float ACCEL_R;
-    float ACCEL_P;
-    float ACCEL_Y;
-    float MAG_R;
-    float MAG_P;
-    float MAG_Y;
-    float AUTO_GYRO_ROTATION_RATE;
-    String GPS_TIME;
-    String GPS_ALTITUDE;
-    String GPS_LATITUDE;
-    String GPS_LONGITUDE;
-    String GPS_SATS;
-    String CMD_ECHO;
-    vector<String> OPTIONAL_DATA;
+    String MISSION_TIME = "0:0:0";
+    int PACKET_COUNT = 0;
+    String MODE = "F";
+    State STATE = BOOT;
+    float ALTITUDE = 0;
+    float TEMPERATURE = 0;
+    float PRESSURE = 0;
+    float VOLTAGE = 0;
+    float GYRO_R = 0, GYRO_P = 0, GYRO_Y = 0;
+    float ACCEL_R = 0, ACCEL_P = 0, ACCEL_Y = 0;
+    float MAG_R = 0, MAG_P = 0, MAG_Y = 0;
+    float AUTO_GYRO_ROTATION_RATE = 0;
+    String GPS_TIME = "0:0";
+    String GPS_ALTITUDE = "0";
+    String GPS_LATITUDE = "0";
+    String GPS_LONGITUDE = "0";
+    String GPS_SATS = "0";
+    String CMD_ECHO = "";
 };
 
-// function prototypes
-
-void checkXbeeHWAvailability();
-
-void showXBEEWarning();
-
-void initializeTelemetryData(TelemetryData &data);
-
-String constructMessage();
-
-String getStateName(int state);
-
-void handleGCSCommand(String cmd);
-
-void confirmGroundStationConn();
-
-float getSmoothedAltitude();
-
-void calculateAltitude();
-
-void calculateGPS();
-
-float changeOfAltitude();
-
+// ---------------------------------------------------------------------------
+// Prototypes
+// ---------------------------------------------------------------------------
 String getStateString(State state);
-
+String constructMessage(const TelemetryData &t);
+void handleGCSCommand(const String &cmd);
 void processBatteryVoltage();
+void confirmGroundStationConn();
+void logLine(const String &msg);
 
-// Thread function prototypes
 void altitudeThread();
-
 void gpsThread();
-
+void commandThread();
+void stateMonitorThread();
 void telemetryThread();
 
-void stateMonitorThread();
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+// Single lines go through logLine(). For a multi-line block, copy the data
+// first, then hold serialLock once for the whole block.
+void logLine(const String &msg) {
+    Threads::Scope lock(serialLock);
+    Serial.println(msg);
+}
 
-void commandThread();
-
-// Mutex for GPS data protection
-Threads::Mutex gpsMutex;
-// Mutex for XBee communication
-Threads::Mutex xbeeMutex;
-
-// flag variables
-bool commEstablished = false;
-TelemetryData telemetryData = {};
-bool telemetryEnabled = false;
-
-// Averaging variables for precise altitude readings
-const int AVG_SAMPLES = 3; // Reduced from 5 to 3 for faster readings
-float altitudeBuffer[AVG_SAMPLES];
-int bufferIndex = 0;
-
-float lastAltitude = 0;
-unsigned long lastAltitudeTime = 0;
-
-float altitude = 0;
-float initialAltitude = 0;
-float highestAltitude = 0;
-float changeAltitude = 0;
-int counter = 0;
-bool cxonCommandReceived = false;
-float landingThresholdAltitude = 5.0;
-float velocity = -1;
-bool altitudeCalibrated = false;
-
-// Add threshold constants
-const float ALTITUDE_THRESHOLD = 200.0; // 2 meters in cm
-const int STABLE_READINGS_REQUIRED = 3; // Number of stable readings required
-const float STABILITY_THRESHOLD = 50.0; // 0.5 meters in cm
-const float DESCENT_THRESHOLD = -200.0; // -2 meters in cm
-const float DESCENT_RATE_THRESHOLD = -500.0; // -5 m/s in cm/s
-const float DESCENT_2_THRESHOLD = 0.75; // 75% of highest altitude for DESCENDING_2
-const int DESCENT_CONFIRMATION_COUNT = 3; // Number of consecutive descent readings required
-const float MIN_VALID_ALTITUDE = -10000.0; // -100 meters in cm
-const float MAX_VALID_ALTITUDE = 1000000.0; // 10000 meters in cm
-const int INITIAL_READINGS = 20; // Number of initial readings to validate sensor
-const float STATIONARY_THRESHOLD = 50.0; // Maximum variation for stationary readings
-const float ASCENT_THRESHOLD = 100.0; // Minimum altitude change to consider as ascending
-const int ASCENT_CONFIRMATION_COUNT = 5; // Number of consecutive ascent readings required
-const float CONSECUTIVE_DIFF_THRESHOLD = 3.0; // Threshold for consecutive altitude differences when stationary
-const float MOVING_DIFF_THRESHOLD = 2.0; // Threshold for consecutive altitude differences when moving
-const int DESCENT_DETECTION_COUNT = 4; // Number of consecutive readings below peak to confirm descent
-const float DESCENT_DETECTION_THRESHOLD = 50.0; // Minimum drop from peak to consider descent (in cm)
-const float MAX_ALTITUDE_CHANGE = 100.0; // Maximum valid altitude change between readings (in cm)
-const int MAX_FAILED_READINGS = 5; // Maximum number of consecutive failed readings before resetting
-
-// Add variables for sensor validation
-float lastReadings[5] = {0}; // Store last 5 readings
-int readingIndex = 0;
-bool sensorStable = false;
-bool sensorValid = false;
-float initialReadings[INITIAL_READINGS];
-int validReadingCount = 0;
-bool isStationary = true;
-int ascentCount = 0;
-float baselineAltitude = 0;
-float lastHighestAltitude = 0;
-int consecutiveDiffCount = 0;
-int movingDiffCount = 0;
-
-// Add variables for descent detection
-int descentCount = 0;
-bool descentConfirmed = false;
-float lastDescentCheck = 0;
-unsigned long lastDescentTime = 0;
-int consecutiveBelowPeakCount = 0; // Counter for consecutive readings below peak
-float peakAltitude = 0; // Track the absolute peak altitude
-float lastValidAltitude = 0; // Store the last valid altitude reading
-bool altitudeValid = false; // Flag to indicate if current altitude is valid
-int failedReadingsCount = 0; // Counter for consecutive failed readings
-float fallbackAltitude = 0; // Fallback altitude to use when sensor fails
-const int analogPin = 15; // Pin 15 connected to the voltage divider 'S'
-const float referenceVoltage = 3.3; // Teensy 4.1 analog reference (default is 3.3V)
-const float multiplier = 5.0;
-
-// Arduino setup and loop functions
-
+// ---------------------------------------------------------------------------
+// setup() and loop()
+// ---------------------------------------------------------------------------
 void setup() {
-    // Initialize serial communication with higher baud rates for improved performance
-    Serial.begin(115200); // Increased from 9600 to 115200 for faster logging
-    Serial8.begin(9600); // XBee 900HP Pro default baud rate (maintain compatibility)
-
+    Serial.begin(115200);
+    xbeeSerial.begin(9600); // XBee 900HP default baud rate
     analogReadResolution(12);
-
-    Serial.println("Cansat Flight Software v2.0 - Multithreaded Edition");
-    Serial.println("Initializing hardware and communication...");
-
-    // Initialize Wire1 for I2C sensors
     Wire1.begin();
-    Wire1.setClock(400000); // Set to 400kHz for faster I2C communication
 
-    // Initiate communication stack (blocking operation)
-    checkXbeeHWAvailability();
+    // No threads are running yet, so direct Serial use is safe here.
+    Serial.println("CanSat Flight Software - Multithreaded Reference");
+    Serial.println("Waiting for the ground station...");
+
     confirmGroundStationConn();
 
-    // Start threads with appropriate priorities (higher number = higher priority)
-    // Process altitude data with highest priority
-    altitudeThreadID = threads.addThread(altitudeThread);
+    altitudeThreadID     = threads.addThread(altitudeThread, 0, THREAD_STACK_SIZE);
+    gpsThreadID          = threads.addThread(gpsThread, 0, THREAD_STACK_SIZE);
+    commandThreadID      = threads.addThread(commandThread, 0, THREAD_STACK_SIZE);
+    stateMonitorThreadID = threads.addThread(stateMonitorThread, 0, THREAD_STACK_SIZE);
+    telemetryThreadID    = threads.addThread(telemetryThread, 0, THREAD_STACK_SIZE);
 
-    // GPS has second highest priority
-    gpsThreadID = threads.addThread(gpsThread);
+    // TeensyThreads schedules round-robin; start order is not priority.
+    // To give a thread more CPU time: threads.setTimeSlice(threadID, ticks);
 
-    // Command processing must be responsive
-    commandThreadID = threads.addThread(commandThread);
-
-    // State monitoring runs at normal priority
-    stateMonitorThreadID = threads.addThread(stateMonitorThread);
-
-    // Telemetry runs at lowest priority as it's not time-critical
-    telemetryThreadID = threads.addThread(telemetryThread);
-
-
-    Serial.println("All threads started successfully");
-    Serial.println("System running in multithreaded mode");
+    logLine("All threads started.");
 }
 
-// Simplified loop - main thread mostly idle since work is done in separate threads
 void loop() {
-    // Print status every 5 seconds
     static unsigned long lastStatusTime = 0;
-    unsigned long currentTime = millis();
+    unsigned long now = millis();
 
-    if (currentTime - lastStatusTime >= 5000) {
-        // Report thread health
+    if (now - lastStatusTime >= 5000) {
+        State state = currentState.load();
+        float alt = sensors.altitude.load() / 100.0f;
+        float peak = sensors.highestAltitude.load() / 100.0f;
+        float vel = sensors.velocity.load();
+        float temp = sensors.temperature.load();
+        bool txOn = telemetryEnabled.load();
+
+        Threads::Scope lock(serialLock);
         Serial.println("===== System Status =====");
         Serial.print(threads.threadsInfo());
+        Serial.print("State: ");       Serial.println(getStateString(state));
+        Serial.print("Altitude: ");    Serial.print(alt);  Serial.println(" m");
+        Serial.print("Peak: ");        Serial.print(peak); Serial.println(" m");
+        Serial.print("Velocity: ");    Serial.print(vel);  Serial.println(" m/s");
+        Serial.print("Temperature: "); Serial.print(temp); Serial.println(" C");
+        Serial.print("Telemetry: ");   Serial.println(txOn ? "ON" : "OFF");
         Serial.println("=========================");
 
-        // Report current state
-        State currentStateSnapshot;
-        stateMutex.lock();
-        currentStateSnapshot = currentState;
-        stateMutex.unlock();
-
-        Serial.print("Current State: ");
-        Serial.println(getStateString(currentStateSnapshot));
-
-        // Report sensor status
-        Serial.print("Altitude: ");
-        Serial.print(safeData.altitude.load() / 100.0);
-        Serial.println(" m");
-
-        Serial.print("Highest: ");
-        Serial.print(safeData.highestAltitude.load() / 100.0);
-        Serial.println(" m");
-
-        Serial.print("Velocity: ");
-        Serial.print(safeData.velocity.load());
-        Serial.println(" m/s");
-
-        Serial.print("Temperature: ");
-        Serial.print(safeData.temperature.load());
-        Serial.println(" C");
-
-        Serial.print("Telemetry Enabled: ");
-        Serial.println(telemetryEnabled ? "Yes" : "No");
-
-        Serial.println("=======================");
-
-        lastStatusTime = currentTime;
+        lastStatusTime = now;
     }
 
-    // Give most CPU time to the threads
-    threads.yield();
-    delay(50);
+    threads.delay(50);
 }
 
-// Custom functions
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+void confirmGroundStationConn() {
+    // Runs in setup() before any thread starts.
+    while (true) {
+        xbeeSerial.println(HANDSHAKE_REQUEST);
+        Serial.print(".");
+
+        unsigned long start = millis();
+        while (millis() - start < 2000) {
+            if (xbeeSerial.available() > 0) {
+                String reply = xbeeSerial.readStringUntil('\n');
+                reply.trim();
+                if (reply == HANDSHAKE_ACK) {
+                    Serial.println("\nGround station connected.");
+                    return;
+                }
+                Serial.println("\nUnexpected reply: " + reply);
+            }
+        }
+    }
+}
 
 void processBatteryVoltage() {
-    int rawADC = analogRead(analogPin); // Read raw ADC value
-    float vOut = (rawADC / 4095.0) * referenceVoltage; // Convert to voltage
-    float vIn = vOut * multiplier; // Calculate original input voltage
-    // Serial.print("Battery Voltage ");
-    // Serial.print(vIn, 3);
-    // Serial.println(" V");
-    safeData.voltage.store(vIn); // Store voltage in telemetry data
+    int raw = analogRead(BATTERY_PIN);
+    float vOut = (raw / 4095.0f) * ADC_REFERENCE;
+    sensors.voltage.store(vOut * DIVIDER_MULTIPLIER);
 }
 
-
-void handleGCSCommand(String cmd) {
-    int slashIndex = cmd.indexOf('/');
-    String beforeSlash = cmd.substring(0, slashIndex);
-    String afterSlash = cmd.substring(slashIndex + 1);
-    telemetryData.CMD_ECHO = cmd;
-
-    Serial.println("Received MQTT command from XBee: " + cmd);
+void handleGCSCommand(const String &cmd) {
+    writeCmdEcho(cmd);
+    logLine("Ground station command: " + cmd);
 
     if (cmd.equals("CX/ON")) {
-        telemetryEnabled = true;
+        telemetryEnabled.store(true);
+        cxonCommandReceived.store(true);
     } else if (cmd.equals("CX/OFF")) {
-        telemetryEnabled = false;
+        telemetryEnabled.store(false);
+    } else {
+        logLine("Unknown command: " + cmd);
     }
 }
 
-void checkXbeeHWAvailability() {
-    while (!Serial8) // Check if Serial8 is available
-    {
-        showXBEEWarning();
-        delay(3000); // Wait for a second
-        Serial8.println("Reinitializing Serial8...");
-        Serial8.begin(9600); // Try to reinitialize Serial8
-    }
-}
-
-void confirmGroundStationConn() {
-    Serial.println("Teensy 4.1 Transmitter started.");
-    Serial8.println("<A3158GCS>");
-    Serial.print("Waiting for GCS acknowledgement...");
-    while (Serial8.available() == 0) {
-        Serial8.println("<A3158GCS>");
-        Serial.print(".");
-        delay(2000); // Add a small delay to avoid flooding the XBee with messages
-    }
-    Serial.println("Acknowledgement received.");
-    String ack = Serial8.readStringUntil('\n');
-    if (ack.trim() == "<A3158ACK>") {
-        Serial.println("Ground Station is ready.");
-        commEstablished = true;
-    }
-}
-
-void showXBEEWarning() {
-    Serial.println("Failed to initialize Serial8!");
-    Serial.println("Check your wiring and try again.");
-    Serial.println("Make sure the XBee is connected to the correct pins.");
-    Serial.println("TX8 = Pin 35, RX8 = Pin 34");
-    Serial.println("Make sure the XBee is powered on.");
-    Serial.println("Make sure the XBee is configured correctly.");
-    Serial.println("Retrying to initialize Serial8...");
-}
-
-// put function definitions here:
-void initializeTelemetryData(TelemetryData &data) {
-    data.TEAM_ID = "3158";
-    data.MODE = 'F';
-    data.MISSION_TIME = "0:0:0";
-    data.GPS_TIME = "0:0";
-    data.STATE = 0;
-
-    if (data.PACKET_COUNT == 0xFFFFFFFF) {
-        data.PACKET_COUNT = 0;
-    }
-}
-
-String constructMessage() {
-    // Construct message using telemetryData struct
-    String message = telemetryData.TEAM_ID + ", " +
-                     telemetryData.MISSION_TIME + ", " +
-                     telemetryData.PACKET_COUNT + ", " +
-                     telemetryData.MODE + ", " +
-                     getStateName(telemetryData.STATE) + ", " +
-                     telemetryData.ALTITUDE + ", " +
-                     telemetryData.TEMPERATURE + ", " +
-                     telemetryData.PRESSURE + ", " +
-                     telemetryData.VOLTAGE + ", " +
-                     telemetryData.GYRO_R + ", " +
-                     telemetryData.GYRO_P + ", " +
-                     telemetryData.GYRO_Y + ", " +
-                     telemetryData.ACCEL_R + ", " +
-                     telemetryData.ACCEL_P + ", " +
-                     telemetryData.ACCEL_Y + ", " +
-                     telemetryData.MAG_R + ", " +
-                     telemetryData.MAG_P + ", " +
-                     telemetryData.MAG_Y + ", " +
-                     telemetryData.AUTO_GYRO_ROTATION_RATE + ", " +
-                     telemetryData.GPS_TIME + ", " +
-                     telemetryData.GPS_ALTITUDE + ", " +
-                     telemetryData.GPS_LATITUDE + ", " +
-                     telemetryData.GPS_LONGITUDE + ", " +
-                     telemetryData.GPS_SATS + ", " +
-                     telemetryData.CMD_ECHO + ", ";
-    return message;
-}
-
-String getStateName(int state) {
-    switch (state) {
-        case 0:
-            return "BOOT";
-        case 1:
-            return "IDLE";
-        case 2:
-            return "PRE_LAUNCH";
-        case 3:
-            return "ASCENDING";
-        case 4:
-            return "DESCENDING_1";
-        case 5:
-            return "DESCENDING_2";
-        case 6:
-            return "LANDING";
-        default:
-            return "Unknown";
-    }
-}
-
-// Helper function to convert state enum to string
 String getStateString(State state) {
     switch (state) {
-        case BOOT:
-            return "BOOT";
-        case IDLE:
-            return "IDLE";
-        case RECOVER:
-            return "RECOVER";
-        case PRE_LAUNCH:
-            return "PRE_LAUNCH";
-        case ASCENDING:
-            return "ASCENDING";
-        case DESCENDING_1:
-            return "DESCENDING_1";
-        case DESCENDING_2:
-            return "DESCENDING_2";
-        case LANDING:
-            return "LANDING";
-        default:
-            return "UNKNOWN";
+        case RECOVER:      return "RECOVER";
+        case BOOT:         return "BOOT";
+        case IDLE:         return "IDLE";
+        case PRE_LAUNCH:   return "PRE_LAUNCH";
+        case ASCENDING:    return "ASCENDING";
+        case DESCENDING_1: return "DESCENDING_1";
+        case DESCENDING_2: return "DESCENDING_2";
+        case LANDING:      return "LANDING";
+        default:           return "UNKNOWN";
     }
 }
 
-// Function for altitude and pressure sensor monitoring thread
+String constructMessage(const TelemetryData &t) {
+    return String(TEAM_ID) + ", " +
+           t.MISSION_TIME + ", " +
+           t.PACKET_COUNT + ", " +
+           t.MODE + ", " +
+           getStateString(t.STATE) + ", " +
+           t.ALTITUDE + ", " +
+           t.TEMPERATURE + ", " +
+           t.PRESSURE + ", " +
+           t.VOLTAGE + ", " +
+           t.GYRO_R + ", " + t.GYRO_P + ", " + t.GYRO_Y + ", " +
+           t.ACCEL_R + ", " + t.ACCEL_P + ", " + t.ACCEL_Y + ", " +
+           t.MAG_R + ", " + t.MAG_P + ", " + t.MAG_Y + ", " +
+           t.AUTO_GYRO_ROTATION_RATE + ", " +
+           t.GPS_TIME + ", " +
+           t.GPS_ALTITUDE + ", " +
+           t.GPS_LATITUDE + ", " +
+           t.GPS_LONGITUDE + ", " +
+           t.GPS_SATS + ", " +
+           t.CMD_ECHO + ", ";
+}
+
+// ---------------------------------------------------------------------------
+// Altitude thread: sole writer of altitude, peak, velocity, temperature,
+// pressure, altitudeValid and sensorStable
+// ---------------------------------------------------------------------------
 void altitudeThread() {
-    // Initialize the sensor locally in the thread
     if (!bmp.begin_I2C(0x77, &Wire1)) {
-        Serial.println("Failed to initialize BMP sensor in altitude thread!");
+        logLine("BMP388 not found on Wire1. Altitude thread stopped.");
+        sensors.altitudeValid.store(false);
         return;
     }
 
-    // Configure the sensor for optimal performance
+    // Set after begin_I2C(), which can reset the bus to its default speed.
+    Wire1.setClock(400000);
+
     bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
     bmp.setPressureOversampling(BMP3_OVERSAMPLING_16X);
     bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_15);
-    bmp.setOutputDataRate(BMP3_ODR_50_HZ); // Increase to 50Hz for faster readings
+    bmp.setOutputDataRate(BMP3_ODR_50_HZ);
 
-    // Local variables for sensor processing
-    float altitudeBuffer[AVG_SAMPLES] = {0};
-    int bufferIndex = 0;
-    float lastReading = 0;
-    int failedReadings = 0;
-    bool calibrated = false;
-    float initialAlt = 0;
-    float peakAlt = 0;
-
-    // For calibration
-    constexpr int CALIBRATION_SAMPLES = 10;
-    float calibrationValues[CALIBRATION_SAMPLES];
-
-    // Get and display current atmospheric pressure
-    if (bmp.performReading()) {
-        float currentPressure = bmp.pressure / 100.0;
-        Serial.print("Current atmospheric pressure: ");
-        Serial.print(currentPressure);
-        Serial.println(" hPa");
-
-        Serial.print("Current altitude with standard sea level pressure (");
-        Serial.print(SEALEVELPRESSURE_HPA);
-        Serial.print(" hPa): ");
-        Serial.print(bmp.readAltitude(SEALEVELPRESSURE_HPA));
-        Serial.println(" meters");
-
-        // Calculate the actual sea level pressure based on known altitude
-        // Uncomment and set your known altitude if needed
-        // float knownAltitude = 0.0; // Replace with your actual altitude in meters
-        // float calculatedSeaLevel = bmp.seaLevelForAltitude(knownAltitude, currentPressure);
-        // Serial.print("Calculated sea level pressure: ");
-        // Serial.print(calculatedSeaLevel);
-        // Serial.println(" hPa");
-    }
-
-    // Calibrate sensor
+    // Calibrate: the average of the first valid readings becomes zero.
+    logLine("Calibrating altitude sensor...");
+    float sum = 0;
     int goodSamples = 0;
-    Serial.println("Calibrating altitude sensor...");
     while (goodSamples < CALIBRATION_SAMPLES) {
         if (bmp.performReading()) {
-            float reading = bmp.readAltitude(SEALEVELPRESSURE_HPA) * 100.0;
+            float reading = bmp.readAltitude(SEALEVELPRESSURE_HPA) * 100.0f;
             if (reading > MIN_VALID_ALTITUDE && reading < MAX_VALID_ALTITUDE) {
-                calibrationValues[goodSamples] = reading;
-                Serial.print("Calibration sample ");
-                Serial.print(goodSamples + 1);
-                Serial.print(": ");
-                Serial.print(reading / 100.0);
-                Serial.println(" meters");
+                sum += reading;
                 goodSamples++;
             }
         }
-        Threads::yield(); // Allow other threads to run during calibration
         threads.delay(20);
     }
+    const float initialAlt = sum / CALIBRATION_SAMPLES;
+    sensors.initialAltitude.store(initialAlt);
+    logLine("Calibration done. Pad altitude: " + String(initialAlt / 100.0f) + " m");
 
-    // Calculate average initial altitude
-    float sum = 0;
-    for (float calibrationValue : calibrationValues) {
-        sum += calibrationValue;
-    }
-    initialAlt = sum / CALIBRATION_SAMPLES;
-    calibrated = true;
-
-    Serial.print("Final calibration: Initial altitude set as zero reference point (");
-    Serial.print(initialAlt / 100.0);
-    Serial.println(" meters)");
-
-    // Store in thread-safe variable
-    safeData.initialAltitude.store(initialAlt);
+    float buffer[AVG_SAMPLES];
+    for (int i = 0; i < AVG_SAMPLES; i++) buffer[i] = initialAlt;
+    int bufferIndex = 0;
+    float lastSmoothed = initialAlt;
+    int failedReadings = 0;
+    float peak = 0;
 
     unsigned long lastVelocityCalc = millis();
-    float lastAltForVel = initialAlt;
+    float lastAltForVel = 0;
 
-    // Main sensor loop
     while (true) {
-        // Read sensor
-        bool validReading = false;
-        float rawAltitude = 0;
-
-        if (bmp.performReading()) {
-            // Get raw altitude in cm
-            rawAltitude = bmp.readAltitude(SEALEVELPRESSURE_HPA) * 100.0;
-
-            // Update temperature and pressure in thread-safe variables
-            safeData.temperature.store(bmp.temperature);
-            safeData.pressure.store(bmp.pressure / 100.0); // Convert to hPa
-
-            failedReadings = 0;
-            validReading = true;
-        } else {
-            failedReadings++;
-            if (failedReadings >= MAX_FAILED_READINGS) {
-                safeData.altitudeValid.store(false);
-                threads.delay(20);
-                continue;
-            }
+        if (!bmp.performReading()) {
+            if (failedReadings < MAX_FAILED_READINGS) failedReadings++;
+            if (failedReadings >= MAX_FAILED_READINGS) sensors.altitudeValid.store(false);
+            threads.delay(20);
+            continue;
         }
+        failedReadings = 0;
 
-        // Skip invalid readings
-        if (!validReading || rawAltitude < MIN_VALID_ALTITUDE || rawAltitude > MAX_VALID_ALTITUDE) {
+        float rawAltitude = bmp.readAltitude(SEALEVELPRESSURE_HPA) * 100.0f;
+        sensors.temperature.store(bmp.temperature);
+        sensors.pressure.store(bmp.pressure / 100.0f);
+
+        if (rawAltitude < MIN_VALID_ALTITUDE || rawAltitude > MAX_VALID_ALTITUDE) {
             threads.delay(20);
             continue;
         }
 
-        // Perform smoothing
-        altitudeBuffer[bufferIndex] = rawAltitude;
+        // Moving average
+        buffer[bufferIndex] = rawAltitude;
         bufferIndex = (bufferIndex + 1) % AVG_SAMPLES;
+        float smoothed = 0;
+        for (int i = 0; i < AVG_SAMPLES; i++) smoothed += buffer[i];
+        smoothed /= AVG_SAMPLES;
 
-        float smoothedAltitude = 0;
-        for (int i = 0; i < AVG_SAMPLES; i++) {
-            smoothedAltitude += altitudeBuffer[i];
-        }
-        smoothedAltitude /= AVG_SAMPLES;
+        float relativeAltitude = smoothed - initialAlt;
 
-        // Normalize to initial altitude if calibrated
-        float relativeAltitude = calibrated ? (smoothedAltitude - initialAlt) : smoothedAltitude;
-
-        // Calculate velocity every 100ms
-        unsigned long currentTime = millis();
-        if (currentTime - lastVelocityCalc >= 100) {
-            // 10Hz velocity updates
-            float timeDiff = (currentTime - lastVelocityCalc) / 1000.0; // seconds
-            float velocityMps = (relativeAltitude - lastAltForVel) / (timeDiff * 100.0); // Convert cm to m
-
-            // Store in thread-safe variable
-            safeData.velocity.store(velocityMps);
-
+        // Vertical velocity at 10 Hz
+        unsigned long now = millis();
+        if (now - lastVelocityCalc >= 100) {
+            float dt = (now - lastVelocityCalc) / 1000.0f;
+            sensors.velocity.store((relativeAltitude - lastAltForVel) / (dt * 100.0f));
             lastAltForVel = relativeAltitude;
-            lastVelocityCalc = currentTime;
+            lastVelocityCalc = now;
         }
 
-        // Track highest altitude
-        if (relativeAltitude > safeData.highestAltitude.load()) {
-            safeData.highestAltitude.store(relativeAltitude);
-            peakAlt = relativeAltitude;
+        if (relativeAltitude > peak) {
+            peak = relativeAltitude;
+            sensors.highestAltitude.store(peak);
         }
 
-        // Store processed values in thread-safe variables
-        safeData.altitude.store(relativeAltitude);
-        safeData.altitudeValid.store(true);
+        sensors.altitude.store(relativeAltitude);
+        sensors.altitudeValid.store(true);
+        sensors.sensorStable.store(fabsf(smoothed - lastSmoothed) <= STABILITY_THRESHOLD);
+        lastSmoothed = smoothed;
 
-        // Check stability
-        if (abs(smoothedAltitude - lastReading) <= STABILITY_THRESHOLD) {
-            safeData.sensorStable.store(true);
-        } else {
-            safeData.sensorStable.store(false);
-        }
-
-        lastReading = smoothedAltitude;
-        threads.delay(BMP_UPDATE_INTERVAL); // ~25Hz update rate
+        threads.delay(BMP_UPDATE_INTERVAL);
     }
 }
 
-// Function for GPS sensor thread
+// ---------------------------------------------------------------------------
+// GPS thread: sole owner of the gps object and Serial5
+// ---------------------------------------------------------------------------
 void gpsThread() {
-    // Configure GPS on Serial5
     gpsSerial.begin(9600);
+    logLine("GPS thread started on Serial5.");
 
-    Serial.println("GPS Thread started - using Serial5");
-    uint8_t gpsRetryCount = 0;
-    bool gpsInitialized = false;
-
-    // Add a small delay to ensure serial port is ready
-    threads.delay(500);
-
-    while (!gpsInitialized && gpsRetryCount < 5) {
-        if (gpsSerial) {
-            Serial.println("GPS Serial5 initialized successfully");
-            gpsInitialized = true;
-        } else {
-            gpsRetryCount++;
-            Serial.print("GPS Serial5 initialization attempt ");
-            Serial.print(gpsRetryCount);
-            Serial.println(" failed, retrying...");
-            gpsSerial.begin(9600);
-            threads.delay(500);
-        }
-    }
-
-    if (!gpsInitialized) {
-        Serial.println("WARNING: Failed to initialize GPS on Serial5!");
-    }
-
-    // Main GPS processing loop
     unsigned long lastSatelliteReport = 0;
 
     while (true) {
-        // Process all available GPS data
         while (gpsSerial.available() > 0) {
-            char c = gpsSerial.read();
-            gps.encode(c);
+            gps.encode(gpsSerial.read());
         }
 
-        // Update GPS data with mutex protection when we have a new position
         if (gps.location.isUpdated()) {
-            gpsMutex.lock();
-            safeData.latitude = gps.location.lat();
-            safeData.longitude = gps.location.lng();
-            safeData.satellites = gps.satellites.value();
-
-            // Update GPS time if valid
+            GpsSnapshot g = readGps();
+            g.latitude = gps.location.lat();
+            g.longitude = gps.location.lng();
+            g.satellites = gps.satellites.value();
+            if (gps.altitude.isValid()) {
+                g.altitude = gps.altitude.meters();
+            }
             if (gps.time.isValid()) {
                 char timeStr[10];
-                sprintf(timeStr, "%02d:%02d", gps.time.hour(), gps.time.minute());
-                safeData.gpsTime = String(timeStr);
+                snprintf(timeStr, sizeof(timeStr), "%02d:%02d",
+                         gps.time.hour(), gps.time.minute());
+                g.time = String(timeStr);
             }
+            writeGps(g);
 
-            // Log updated GPS data for debugging
-            Serial.print("GPS update - Lat: ");
-            Serial.print(safeData.latitude, 6);
-            Serial.print(", Long: ");
-            Serial.print(safeData.longitude, 6);
-            Serial.print(", Sats: ");
-            Serial.println(safeData.satellites);
-
-            gpsMutex.unlock();
+            logLine("GPS fix: " + String(g.latitude, 6) + ", " + String(g.longitude, 6) +
+                    " | Sats: " + String(g.satellites));
         }
 
-        // Periodically report satellite count even if position hasn't been updated
-        unsigned long currentTime = millis();
-        if (currentTime - lastSatelliteReport > 5000) {
-            // Every 5 seconds
-            Serial.print("GPS satellites in view: ");
-            Serial.println(gps.satellites.value());
-            lastSatelliteReport = currentTime;
+        unsigned long now = millis();
+        if (now - lastSatelliteReport > 5000) {
+            logLine("GPS satellites in view: " + String(gps.satellites.value()));
+            lastSatelliteReport = now;
         }
 
-        threads.delay(GPS_UPDATE_INTERVAL); // 10Hz GPS processing
+        threads.delay(GPS_UPDATE_INTERVAL);
     }
 }
 
-// Function for telemetry thread
-void telemetryThread() {
-    // Initialize telemetry data
-    TelemetryData threadTelemetry = {};
-    initializeTelemetryData(threadTelemetry);
+// ---------------------------------------------------------------------------
+// Command thread: owns XBee reads
+// Commands arrive framed as <C + command + >, for example <CCX/ON>.
+// ---------------------------------------------------------------------------
+void commandThread() {
+    String received = "";
 
-    // Main telemetry loop
     while (true) {
-        if (telemetryEnabled) {
-            // Capture the current state with mutex protection
-            State currentStateSnapshot; {
-                stateMutex.lock();
-                currentStateSnapshot = currentState;
-                stateMutex.unlock();
-            }
-
-            // Update packet count thread-safely
-            threadTelemetry.PACKET_COUNT = safeData.packetCount.fetch_add(1);
-
-            // Get current time (could be improved with RTC)
-            unsigned long uptime = millis() / 1000; // Convert to seconds
-            int hours = uptime / 3600;
-            int minutes = (uptime % 3600) / 60;
-            int seconds = uptime % 60;
-            char timeStr[10];
-            sprintf(timeStr, "%d:%d:%d", hours, minutes, seconds);
-            threadTelemetry.MISSION_TIME = String(timeStr);
-
-            // Copy current sensor values
-            threadTelemetry.ALTITUDE = safeData.altitude.load() / 100.0; // Convert cm to m
-            threadTelemetry.TEMPERATURE = safeData.temperature.load();
-            threadTelemetry.PRESSURE = safeData.pressure.load();
-            threadTelemetry.VOLTAGE = safeData.voltage.load();
-            threadTelemetry.STATE = static_cast<int>(currentStateSnapshot);
-
-            // Get GPS data with mutex protection
-            {
-                gpsMutex.lock();
-                threadTelemetry.GPS_LATITUDE = String(safeData.latitude, 6);
-                threadTelemetry.GPS_LONGITUDE = String(safeData.longitude, 6);
-                threadTelemetry.GPS_SATS = String(safeData.satellites);
-                threadTelemetry.GPS_TIME = safeData.gpsTime;
-                threadTelemetry.GPS_ALTITUDE = String(safeData.altitude.load() / 100.0); // Use BMP altitude
-                gpsMutex.unlock();
-            }
-
-            // IMPORTANT: Update the global telemetryData (needed for constructMessage)
-            xbeeMutex.lock();
-            telemetryData = threadTelemetry;
-
-            // Construct message using updated telemetryData
-            String dataToSend = "<T" + constructMessage() + ">";
-
-            // Send data to XBee
-            Serial8.println(dataToSend);
-
-            // Debug output
-            Serial.println("Sending telemetry packet #" + String(threadTelemetry.PACKET_COUNT));
-            Serial.println("Altitude: " + String(threadTelemetry.ALTITUDE) + " m");
-            Serial.println("Temperature: " + String(threadTelemetry.TEMPERATURE) + " C");
-            Serial.println("Pressure: " + String(threadTelemetry.PRESSURE) + " hPa");
-
-            // Add GPS debug output
-            Serial.println("GPS Latitude: " + threadTelemetry.GPS_LATITUDE);
-            Serial.println("GPS Longitude: " + threadTelemetry.GPS_LONGITUDE);
-            Serial.println("GPS Satellites: " + threadTelemetry.GPS_SATS);
-            Serial.println("GPS Time: " + threadTelemetry.GPS_TIME);
-
-            // Serial.println("Voltage: " + threadTelemetry.VOLTAGE + " V");
-
-            xbeeMutex.unlock();
-        }
-
-        threads.delay(TELEMETRY_INTERVAL); // 1Hz telemetry updates
-    }
-}
-
-// Function for state monitoring thread
-void stateMonitorThread() {
-    // Wait for sensors to initialize
-    threads.delay(2000);
-
-    State currentStateLocal = BOOT;
-    State lastStateLocal = BOOT;
-
-    // Local variables for state monitoring
-    int consecutiveBelowPeakCount = 0;
-    bool cxonReceived = false;
-
-    // Main state monitoring loop
-    while (true) {
-        // Get current altitude and status
-        float altitude = safeData.altitude.load();
-        float highestAltitude = safeData.highestAltitude.load();
-        float velocity = safeData.velocity.load();
-        bool altitudeValid = safeData.altitudeValid.load();
-        bool sensorStable = safeData.sensorStable.load();
-
-        // Update current state (with mutex protection)
+        // Drain everything waiting in one short locked section, parse outside it.
+        char chunk[64];
+        int n = 0;
         {
-            stateMutex.lock();
-            currentStateLocal = currentState;
-            stateMutex.unlock();
+            Threads::Scope lock(xbeeLock);
+            while (n < (int)sizeof(chunk) && xbeeSerial.available() > 0) {
+                chunk[n++] = (char)xbeeSerial.read();
+            }
         }
 
-        // State transition logic
-        State nextState = currentStateLocal;
+        for (int i = 0; i < n; i++) {
+            received += chunk[i];
 
-        switch (currentStateLocal) {
+            int start = received.indexOf('<');
+            int end = (start == -1) ? -1 : received.indexOf('>', start + 1);
+            if (end != -1) {
+                String payload = received.substring(start + 1, end);
+                received = received.substring(end + 1);
+
+                if (payload.length() > 1 && payload.charAt(0) == 'C') {
+                    handleGCSCommand(payload.substring(1));
+                } else {
+                    logLine("Ignored frame: <" + payload + ">");
+                }
+            }
+
+            if (received.length() > 100) {
+                logLine("Command buffer overflow, resetting.");
+                received = "";
+            }
+        }
+
+        threads.delay(COMMAND_POLL_INTERVAL);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State monitor thread: sole writer of currentState
+// ---------------------------------------------------------------------------
+void stateMonitorThread() {
+    threads.delay(2000); // Let the sensors settle.
+
+    int ascentCount = 0;
+    int belowPeakCount = 0;
+
+    while (true) {
+        float altitude = sensors.altitude.load();       // cm
+        float highest = sensors.highestAltitude.load(); // cm
+        float velocity = sensors.velocity.load();       // m/s
+        bool altitudeValid = sensors.altitudeValid.load();
+        bool sensorStable = sensors.sensorStable.load();
+
+        State state = currentState.load();
+        State next = state;
+
+        switch (state) {
             case RECOVER:
-                nextState = IDLE;
-                break;
-
             case BOOT:
-                nextState = IDLE;
+                next = IDLE;
                 break;
 
             case IDLE:
-                if (cxonReceived || cxonCommandReceived) {
-                    nextState = PRE_LAUNCH;
-                }
+                if (cxonCommandReceived.load()) next = PRE_LAUNCH;
                 break;
 
             case PRE_LAUNCH:
-                if (sensorStable && altitudeValid) {
-                    nextState = ASCENDING;
+                // Climbing past 1 m for several consecutive readings means launch.
+                if (altitudeValid && altitude > ASCENT_THRESHOLD) {
+                    if (++ascentCount >= ASCENT_CONFIRMATION_COUNT) next = ASCENDING;
+                } else {
+                    ascentCount = 0;
                 }
                 break;
 
             case ASCENDING:
-                if (altitudeValid && highestAltitude > 0) {
-                    // Check for descent
-                    if (altitude < (highestAltitude - DESCENT_DETECTION_THRESHOLD)) {
-                        consecutiveBelowPeakCount++;
-
-                        // Confirm descent with multiple readings
-                        if (consecutiveBelowPeakCount >= DESCENT_DETECTION_COUNT) {
-                            nextState = DESCENDING_1;
-                        }
+                // Several consecutive readings below the peak means apogee passed.
+                if (altitudeValid && highest > 0) {
+                    if (altitude < highest - DESCENT_DETECTION_THRESHOLD) {
+                        if (++belowPeakCount >= DESCENT_DETECTION_COUNT) next = DESCENDING_1;
                     } else {
-                        consecutiveBelowPeakCount = 0;
-                    }
-                }
-                break;
-
-            case DESCENDING_1:
-                if (sensorStable && altitude <= (highestAltitude * DESCENT_2_THRESHOLD)) {
-                    nextState = DESCENDING_2;
-                }
-                break;
-
-            case DESCENDING_2:
-                if (sensorStable && altitude < landingThresholdAltitude && abs(velocity) < 0.5) {
-                    nextState = LANDING;
-                }
-                break;
-
-            case LANDING:
-                // Terminal state, no transition
-                break;
-        }
-
-        // Update state if changed (with mutex protection)
-        if (nextState != currentStateLocal) {
-            stateMutex.lock();
-            lastState = currentState;
-            currentState = nextState;
-            stateMutex.unlock();
-
-            // Log state transition
-            Serial.print("State transition: ");
-            Serial.print(getStateString(currentStateLocal));
-            Serial.print(" -> ");
-            Serial.println(getStateString(nextState));
-
-            // Update local state
-            lastStateLocal = currentStateLocal;
-            currentStateLocal = nextState;
-        }
-
-        threads.delay(100); // 10Hz state monitoring
-    }
-}
-
-// Function for command processing thread
-void commandThread() {
-    static String receivedData = "";
-
-    while (true) {
-        // Check for XBee commands with mutex protection
-        xbeeMutex.lock();
-        bool dataAvailable = xbeeSerial.available() > 0;
-        xbeeMutex.unlock();
-
-        if (dataAvailable) {
-            xbeeMutex.lock();
-            char character = xbeeSerial.read();
-            xbeeMutex.unlock();
-
-            receivedData += character;
-
-            // Debug print to verify data reception
-            if (character == '>' || character == '\n') {
-                Serial.print("Raw XBee data received: ");
-                Serial.println(receivedData);
-            }
-
-            // Process complete commands
-            if (receivedData.indexOf('<') != -1 && receivedData.indexOf('>') != -1) {
-                int startIdx = receivedData.indexOf('<') + 1;
-                int endIdx = receivedData.indexOf('>');
-
-                if (startIdx < endIdx) {
-                    String extractedData = receivedData.substring(startIdx, endIdx);
-
-                    // Log the received command for debugging
-                    Serial.print("Command received: ");
-                    Serial.println(extractedData);
-
-                    // Process the command based on type
-                    if (extractedData.length() > 0) {
-                        char cmdType = extractedData.charAt(0);
-
-                        switch (cmdType) {
-                            case 'C': // Control commands
-                                handleGCSCommand(extractedData.substring(1));
-                                break;
-
-                            default:
-                                Serial.print("Unknown command type: ");
-                                Serial.println(cmdType);
-                                break;
-                        }
-                    }
-                }
-
-                receivedData = ""; // Reset for next command
-            }
-
-            // Reset buffer if it gets too long without finding a complete command
-            if (receivedData.length() > 100) {
-                Serial.println("Command buffer overflow - resetting");
-                receivedData = "";
-            }
-        }
-
-        threads.delay(20); // 50Hz command checking
-    }
-}
-
-// Timer interrupt for precision control (if needed)
-IntervalTimer stateTimer;
+                        belowPeakCount = 
